@@ -1,5 +1,6 @@
 import heapq
 from terrain import Plain, Mountain, Road, Pond
+from get_map import CELLS
 
 INF = float('inf')
 
@@ -173,3 +174,326 @@ def get_path(src, dst, parent, parent_dir) :
     cells.reverse()
     directions.reverse()
     return cells, directions
+
+
+def evaluate_spot(
+    spot: dict,
+    dist_step: int,
+    dist_fuel: int,
+    visited_brands_all_time: set,
+    visited_brands_today: set,
+    visited_spots_today: set,
+) -> float:
+    """
+    Tính điểm ưu tiên cho một điểm udon theo các tiêu chí xếp hạng của cuộc thi:
+    1. Ưu tiên 1 (+10000): Loại udon (brand) chưa từng thu thập trong toàn bộ giải đấu.
+    2. Ưu tiên 2 (+2000): Loại udon chưa thu thập trong ngày hôm nay.
+    3. Ưu tiên 3 (+200): Thu thập thêm phần udon (chưa ghé spot này trong ngày).
+    4. Trừ điểm chi phí: Càng tốn ít step và fuel thì điểm càng cao.
+    """
+    pos = spot["pos"]
+    brand = spot["brand"]
+    stock = spot.get("stocks", 1)
+
+    if stock <= 0 or pos in visited_spots_today:
+        return -float("inf")
+
+    score = 0.0
+
+    # Tiêu chí 1: Brand chưa từng ăn
+    if brand not in visited_brands_all_time:
+        score += 10000.0
+
+    # Tiêu chí 2: Brand chưa ăn trong ngày hôm nay
+    if brand not in visited_brands_today:
+        score += 2000.0
+
+    # Tiêu chí 3: Tích lũy thêm phần udon
+    score += 200.0
+
+    # Trừ chi phí di chuyển (ưu tiên đường ngắn, tiết kiệm step và xăng)
+    score -= dist_step * 2.0
+    score -= dist_fuel * 1.0
+
+    return score
+
+
+def plan_patrol_agent_day(
+    current_pos: int,
+    current_fuel: int,
+    day_steps: int,
+    spots: list,
+    adj: list,
+    cost: list,
+    visited_brands_all_time: set,
+    visited_brands_today: set,
+    visited_spots_today: set,
+    has_companion_supply: bool = False,
+) -> tuple:
+    """
+    Lập kế hoạch di chuyển tối ưu cho 1 xe tuần tra trong ngày.
+
+    :return: (actions, final_pos, remaining_fuel)
+    """
+    curr = current_pos
+    fuel = current_fuel
+    remaining_steps = day_steps
+    actions = []
+
+    while True:
+        # Chạy Dijkstra từ vị trí hiện tại đến mọi ô
+        dist_step, dist_fuel, parent, parent_dir = dijkstra(curr, adj, cost)
+
+        best_spot = None
+        best_score = -float("inf")
+        best_dirs = None
+
+        for s in spots:
+            t_pos = s["pos"]
+            d_s = dist_step[t_pos]
+            d_f = dist_fuel[t_pos]
+
+            if d_s == INF or d_s > remaining_steps:
+                continue
+
+            # Nếu không có xe tiếp tế đi kèm, phải đảm bảo đủ xăng
+            if not has_companion_supply and d_f > fuel:
+                continue
+
+            sc = evaluate_spot(
+                spot=s,
+                dist_step=d_s,
+                dist_fuel=d_f,
+                visited_brands_all_time=visited_brands_all_time,
+                visited_brands_today=visited_brands_today,
+                visited_spots_today=visited_spots_today,
+            )
+
+            if sc > best_score:
+                _, dirs = get_path(curr, t_pos, parent, parent_dir)
+                if dirs is not None:
+                    best_score = sc
+                    best_spot = s
+                    best_dirs = dirs
+
+        # Nếu không còn spot nào khả thi hoặc không đem lại điểm số
+        if best_spot is None or best_score <= -1000:
+            break
+
+        # Thực hiện di chuyển đến best_spot
+        actions.extend(best_dirs)
+        remaining_steps -= dist_step[best_spot["pos"]]
+        if not has_companion_supply:
+            fuel -= dist_fuel[best_spot["pos"]]
+
+        curr = best_spot["pos"]
+        visited_spots_today.add(curr)
+        visited_brands_today.add(best_spot["brand"])
+        visited_brands_all_time.add(best_spot["brand"])
+
+    # Bù số step còn lại trong ngày bằng lệnh CHỜ (âm)
+    if remaining_steps > 0:
+        actions.append(-remaining_steps)
+
+    return actions, curr, fuel
+
+
+def plan_move_towards(
+    start_pos: int,
+    target_pos: int,
+    day_steps: int,
+    adj: list,
+    cost: list,
+) -> tuple:
+    """
+    Điều khiển xe di chuyển về phía một ô đích (dùng cho xe tiếp tế đi hỗ trợ).
+    Nếu đến đích mà còn dư step -> Chờ số step còn lại.
+    Nếu không đủ step để đến tận nơi -> Đi xa nhất có thể dọc theo đường đi ngắn nhất.
+
+    :return: (actions, final_pos)
+    """
+    if start_pos == target_pos:
+        return [-day_steps], start_pos
+
+    dist_step, _, parent, parent_dir = dijkstra(start_pos, adj, cost)
+    _, directions = get_path(start_pos, target_pos, parent, parent_dir)
+
+    if directions is None or len(directions) == 0:
+        return [-day_steps], start_pos
+
+    actions = []
+    curr = start_pos
+    steps_used = 0
+
+    for d in directions:
+        step_cost, _ = cost[curr]
+        if steps_used + step_cost > day_steps:
+            break
+        actions.append(d)
+        steps_used += step_cost
+        curr = adj[curr][d]
+
+    remaining_steps = day_steps - steps_used
+    if remaining_steps > 0:
+        actions.append(-remaining_steps)
+
+    return actions, curr
+
+
+def solve_daily_actions(
+    map_config: dict,
+    match_status: dict,
+    game_state: dict = None,
+) -> list:
+    """
+    Hàm tổng thể điều phối toàn bộ các Agent (tuần tra & tiếp tế) trong một ngày thi đấu.
+
+    Tự động áp dụng:
+    - Loại của từng xe (0: Tuần tra, 1: Tiếp tế)
+    - Ghép cặp hỗ trợ nếu có xe tiếp tế
+    - Tránh trùng lặp tiệm udon và tối đa hóa các loại udon thu thập được.
+
+    :param map_config: Dữ liệu cấu hình bản đồ từ server
+    :param match_status: Dữ liệu trạng thái ngày hôm nay từ server
+    :param game_state: Trạng thái xuyên suốt giải đấu (lưu các loại udon đã ăn)
+    :return: all_agents_actions (List mảng 2 chiều sẵn sàng nộp lên server)
+    """
+    if game_state is None:
+        game_state = {}
+
+    if "visited_brands_all_time" not in game_state:
+        game_state["visited_brands_all_time"] = set()
+
+    visited_brands_all_time = game_state["visited_brands_all_time"]
+    visited_brands_today = set()
+    visited_spots_today = set()
+
+    map_info = map_config.get("map", {})
+    width = map_info.get("width", 8)
+    height = map_info.get("height", 8)
+    cells = map_info.get("cells", [])
+    terrain = flatten_cells(cells)
+    spots = map_config.get("spots", [])
+
+    day = match_status.get("day", 0)
+    day_steps_list = map_config.get("daySteps", [50])
+    day_steps = day_steps_list[day] if day < len(day_steps_list) else day_steps_list[-1]
+
+    # Xây dựng đồ thị và cập nhật tình trạng giao thông ngày hôm nay
+    adj = build_adj(terrain, width, height)
+    cost = build_cost(terrain)
+    traffics = match_status.get("traffics", [])
+    if traffics:
+        update_traffic(cost, traffics)
+
+    agents = match_status.get("agents", [])
+    num_agents = len(agents)
+
+    # Khởi tạo kết quả cho từng xe
+    all_agents_actions = [None] * num_agents
+    final_positions = [None] * num_agents
+
+    # Xác định danh sách xe tuần tra và xe tiếp tế
+    patrol_indices = [i for i, a in enumerate(agents) if a.get("kind", 0) == 0]
+    supply_indices = [i for i, a in enumerate(agents) if a.get("kind", 0) == 1]
+
+    # KỊCH BẢN 1: CÓ GHÉP CẶP (Số xe tiếp tế tương đương xe tuần tra, ví dụ [0, 1, 0, 1])
+    if len(supply_indices) > 0 and len(supply_indices) == len(patrol_indices):
+        for p_idx, s_idx in zip(patrol_indices, supply_indices):
+            p_agent = agents[p_idx]
+            s_agent = agents[s_idx]
+
+            # Nếu 2 xe đang ở cùng 1 ô -> Đi cùng nhau (xe tuần tra có vô hạn xăng)
+            if p_agent["pos"] == s_agent["pos"]:
+                p_actions, p_final, _ = plan_patrol_agent_day(
+                    current_pos=p_agent["pos"],
+                    current_fuel=p_agent.get("fuel", 20),
+                    day_steps=day_steps,
+                    spots=spots,
+                    adj=adj,
+                    cost=cost,
+                    visited_brands_all_time=visited_brands_all_time,
+                    visited_brands_today=visited_brands_today,
+                    visited_spots_today=visited_spots_today,
+                    has_companion_supply=True,
+                )
+                all_agents_actions[p_idx] = p_actions
+                all_agents_actions[s_idx] = list(p_actions)  # Xe tiếp tế đi y hệt để giữ cùng ô
+                final_positions[p_idx] = p_final
+                final_positions[s_idx] = p_final
+            else:
+                # Nếu chưa ở cùng ô (như đầu ngày 1) -> Xe tuần tra đi theo xăng riêng, xe tiếp tế tiến lại gần
+                p_actions, p_final, _ = plan_patrol_agent_day(
+                    current_pos=p_agent["pos"],
+                    current_fuel=p_agent.get("fuel", 20),
+                    day_steps=day_steps,
+                    spots=spots,
+                    adj=adj,
+                    cost=cost,
+                    visited_brands_all_time=visited_brands_all_time,
+                    visited_brands_today=visited_brands_today,
+                    visited_spots_today=visited_spots_today,
+                    has_companion_supply=False,
+                )
+                s_actions, s_final = plan_move_towards(
+                    start_pos=s_agent["pos"],
+                    target_pos=p_final,
+                    day_steps=day_steps,
+                    adj=adj,
+                    cost=cost,
+                )
+                all_agents_actions[p_idx] = p_actions
+                all_agents_actions[s_idx] = s_actions
+                final_positions[p_idx] = p_final
+                final_positions[s_idx] = s_final
+
+    # KỊCH BẢN 2: 1 XE TIẾP TẾ DUY NHẤT (Ví dụ [0, 0, 0, 1]) HOẶC 100% TUẦN TRA ([0, 0, 0, 0])
+    else:
+        # Lập kế hoạch cho tất cả các xe tuần tra trước
+        for p_idx in patrol_indices:
+            p_agent = agents[p_idx]
+            p_actions, p_final, _ = plan_patrol_agent_day(
+                current_pos=p_agent["pos"],
+                current_fuel=p_agent.get("fuel", 20),
+                day_steps=day_steps,
+                spots=spots,
+                adj=adj,
+                cost=cost,
+                visited_brands_all_time=visited_brands_all_time,
+                visited_brands_today=visited_brands_today,
+                visited_spots_today=visited_spots_today,
+                has_companion_supply=False,
+            )
+            all_agents_actions[p_idx] = p_actions
+            final_positions[p_idx] = p_final
+
+        # Xe tiếp tế (nếu có) sẽ đi hỗ trợ xe tuần tra đang có ít xăng nhất
+        for s_idx in supply_indices:
+            s_agent = agents[s_idx]
+            # Tìm xe tuần tra có lượng xăng ít nhất
+            target_patrol_idx = min(
+                patrol_indices,
+                key=lambda idx: agents[idx].get("fuel", 20),
+                default=None,
+            )
+            if target_patrol_idx is not None:
+                target_pos = final_positions[target_patrol_idx]
+                s_actions, _ = plan_move_towards(
+                    start_pos=s_agent["pos"],
+                    target_pos=target_pos,
+                    day_steps=day_steps,
+                    adj=adj,
+                    cost=cost,
+                )
+            else:
+                s_actions = [-day_steps]
+
+            all_agents_actions[s_idx] = s_actions
+
+    # Đảm bảo mọi xe đều có danh sách hành động hợp lệ
+    for i in range(num_agents):
+        if all_agents_actions[i] is None:
+            all_agents_actions[i] = [-day_steps]
+
+    return all_agents_actions
+
